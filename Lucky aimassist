@@ -1,0 +1,595 @@
+--[[
+  _               _          
+ | |             | |         
+ | |    _   _ ___| | ___   _ 
+ | |   | | | / __| |/ / | | |
+ | |___| |_| \__ \   <| |_| |
+ |______\__,_|___/_|\_\\__, |
+                        __/ |
+                       |___/ 
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local AimEnabled = false
+local ESPEnabled = false
+local FOVCircleEnabled = false
+local FOV = 120
+local TrackingStrength = 0.20
+local WallCheck = true
+local TeamCheck = true
+local ESPHighlights = {}
+local ConfigFileName = "LuckyConfig.json"
+
+local function ReadSavedConfig()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then
+        return
+    end
+    local ok, data = pcall(function()
+        if not isfile(ConfigFileName) then return nil end
+        return HttpService:JSONDecode(readfile(ConfigFileName))
+    end)
+    if ok and type(data) == "table" then
+        if type(data.FOV) == "number" then FOV = math.clamp(data.FOV, 20, 300) end
+        if type(data.TrackingStrength) == "number" then TrackingStrength = math.clamp(data.TrackingStrength, 0.01, 0.50) end
+        if type(data.TeamCheck) == "boolean" then TeamCheck = data.TeamCheck end
+        if type(data.AimEnabled) == "boolean" then AimEnabled = data.AimEnabled end
+        if type(data.ESPEnabled) == "boolean" then ESPEnabled = data.ESPEnabled end
+        if type(data.FOVCircleEnabled) == "boolean" then FOVCircleEnabled = data.FOVCircleEnabled end
+    end
+end
+ReadSavedConfig()
+
+local TEAM_MARKERS = {
+    "StageTeamSide", "Team", "TeamName", "TeamColor",
+    "TeamId", "TeamID", "team"
+}
+
+local function readTeamMarker(instance)
+    if not instance then return nil end
+    for _, name in ipairs(TEAM_MARKERS) do
+        local attribute = instance:GetAttribute(name)
+        if attribute ~= nil then
+            return name .. "=" .. tostring(attribute)
+        end
+        local child = instance:FindFirstChild(name)
+        if child and child:IsA("ValueBase") then
+            return name .. "=" .. tostring(child.Value)
+        end
+    end
+    return nil
+end
+
+local function getCustomTeamIdentity(targetPlayer)
+    if not targetPlayer then return nil end
+    local marker = readTeamMarker(targetPlayer)
+        or readTeamMarker(targetPlayer.Character)
+    if marker then return marker end
+    local stats = targetPlayer:FindFirstChild("leaderstats")
+    marker = readTeamMarker(stats)
+    if marker then return marker end
+    if not targetPlayer.Neutral then
+        return "TeamColor=" .. tostring(targetPlayer.TeamColor)
+    end
+    return nil
+end
+
+local customTeamCache = { count = 0, at = 0 }
+local function getCustomTeamCount()
+    local now = os.clock()
+    if now - customTeamCache.at > 0.5 then
+        local seen, count = {}, 0
+        for _, targetPlayer in ipairs(Players:GetPlayers()) do
+            local identity = getCustomTeamIdentity(targetPlayer)
+            if identity and not seen[identity] then
+                seen[identity] = true
+                count = count + 1
+            end
+        end
+        customTeamCache.count = count
+        customTeamCache.at = now
+    end
+    return customTeamCache.count
+end
+
+local function isTeammate(targetPlayer)
+    if not targetPlayer or targetPlayer == LocalPlayer then return false end
+    if LocalPlayer.Team and targetPlayer.Team then
+        return LocalPlayer.Team == targetPlayer.Team
+    end
+    local localTeam = getCustomTeamIdentity(LocalPlayer)
+    local targetTeam = getCustomTeamIdentity(targetPlayer)
+    if not localTeam or not targetTeam then return false end
+    return getCustomTeamCount() >= 2 and localTeam == targetTeam
+end
+
+local OldGui = PlayerGui:FindFirstChild("LuckyAimAssist")
+if OldGui then
+	OldGui:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "LuckyAimAssist"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 100
+ScreenGui.Parent = PlayerGui
+
+local FOVCircle = Instance.new("Frame")
+FOVCircle.Name = "FOVCircle"
+FOVCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+FOVCircle.Position = UDim2.fromScale(0.5, 0.5)
+FOVCircle.Size = UDim2.fromOffset(FOV * 2, FOV * 2)
+FOVCircle.BackgroundTransparency = 1
+FOVCircle.BorderSizePixel = 0
+FOVCircle.Visible = FOVCircleEnabled
+FOVCircle.ZIndex = 2
+FOVCircle.Parent = ScreenGui
+
+local FOVCircleCorner = Instance.new("UICorner")
+FOVCircleCorner.CornerRadius = UDim.new(1, 0)
+FOVCircleCorner.Parent = FOVCircle
+
+local FOVCircleStroke = Instance.new("UIStroke")
+FOVCircleStroke.Color = Color3.fromRGB(255, 255, 255)
+FOVCircleStroke.Thickness = 1
+FOVCircleStroke.Transparency = 0.05
+FOVCircleStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+FOVCircleStroke.Parent = FOVCircle
+
+local Menu = Instance.new("Frame")
+Menu.Name = "MiniMenu"
+Menu.Size = UDim2.fromOffset(210, 270)
+Menu.AnchorPoint = Vector2.new(0.5, 0.5)
+Menu.Position = UDim2.new(0.5, 0, 0.4, 0)
+Menu.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+Menu.BackgroundTransparency = 0
+Menu.BorderSizePixel = 0
+Menu.ClipsDescendants = true
+Menu.Visible = true
+Menu.Active = true
+Menu.Parent = ScreenGui
+
+-- Changed to a TextButton with "L" logo
+local ToggleButton = Instance.new("TextButton")
+ToggleButton.Name = "ToggleButton"
+ToggleButton.Size = UDim2.fromOffset(54, 54)
+ToggleButton.AnchorPoint = Vector2.new(0.5, 0.5)
+ToggleButton.Position = UDim2.new(0.5, 0, 0.75, 0)
+ToggleButton.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+ToggleButton.BackgroundTransparency = 0
+ToggleButton.BorderSizePixel = 0
+ToggleButton.ClipsDescendants = true
+ToggleButton.Text = "L"
+ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleButton.TextSize = 26
+ToggleButton.Font = Enum.Font.GothamBold
+ToggleButton.ZIndex = 10
+ToggleButton.Visible = true
+ToggleButton.Active = true
+ToggleButton.AutoButtonColor = false
+ToggleButton.Parent = ScreenGui
+
+local ToggleCorner = Instance.new("UICorner")
+ToggleCorner.CornerRadius = UDim.new(0, 14)
+ToggleCorner.Parent = ToggleButton
+
+local ToggleStroke = Instance.new("UIStroke")
+ToggleStroke.Thickness = 2
+ToggleStroke.Color = Color3.fromRGB(30, 140, 60)
+ToggleStroke.Transparency = 0
+ToggleStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+ToggleStroke.Parent = ToggleButton
+
+local ToggleDragging = false
+local ToggleDragStart
+local ToggleStartPosition
+local ToggleDragInput
+local ToggleMoved = false
+
+local function UpdateToggleDrag(Input)
+	local Delta = Input.Position - ToggleDragStart
+	if Delta.Magnitude > 8 then
+		ToggleMoved = true
+	end
+	local TargetPosition = UDim2.new(
+		ToggleStartPosition.X.Scale,
+		ToggleStartPosition.X.Offset + Delta.X,
+		ToggleStartPosition.Y.Scale,
+		ToggleStartPosition.Y.Offset + Delta.Y
+	)
+	ToggleButton.Position = ToggleButton.Position:Lerp(TargetPosition, 0.35)
+end
+
+local function StartToggleDrag(Input)
+	ToggleDragging = true
+	ToggleMoved = false
+	ToggleDragStart = Input.Position
+	ToggleStartPosition = ToggleButton.Position
+	Input.Changed:Connect(function()
+		if Input.UserInputState == Enum.UserInputState.End then
+			ToggleDragging = false
+		end
+	end)
+end
+
+ToggleButton.InputBegan:Connect(function(Input)
+	if Input.UserInputType == Enum.UserInputType.MouseButton1
+		or Input.UserInputType == Enum.UserInputType.Touch then
+		StartToggleDrag(Input)
+	end
+end)
+
+ToggleButton.InputChanged:Connect(function(Input)
+	if Input.UserInputType == Enum.UserInputType.MouseMovement
+		or Input.UserInputType == Enum.UserInputType.Touch then
+		ToggleDragInput = Input
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(Input)
+	if Input == ToggleDragInput and ToggleDragging then
+		UpdateToggleDrag(Input)
+	end
+end)
+
+ToggleButton.Activated:Connect(function()
+	if ToggleMoved then
+		ToggleMoved = false
+		return
+	end
+	Menu.Visible = not Menu.Visible
+end)
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 10)
+Corner.Parent = Menu
+
+local Stroke = Instance.new("UIStroke")
+Stroke.Thickness = 1
+Stroke.Color = Color3.fromRGB(150, 150, 155)
+Stroke.Parent = Menu
+
+local Title = Instance.new("TextLabel")
+Title.Name = "Title"
+Title.BackgroundTransparency = 1
+Title.Position = UDim2.fromOffset(10, 5)
+Title.Size = UDim2.new(1, -92, 0, 25)
+Title.Font = Enum.Font.GothamBold
+Title.Text = "Lucky Aim Assist"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 14
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.ZIndex = 3
+Title.Parent = Menu
+
+local SaveConfigButton = Instance.new("TextButton")
+SaveConfigButton.Name = "SaveConfigButton"
+SaveConfigButton.Position = UDim2.new(1, -82, 0, 6)
+SaveConfigButton.Size = UDim2.fromOffset(72, 21)
+SaveConfigButton.BackgroundColor3 = Color3.fromRGB(58, 58, 62)
+SaveConfigButton.BorderSizePixel = 0
+SaveConfigButton.Font = Enum.Font.GothamBold
+SaveConfigButton.Text = "Save Config"
+SaveConfigButton.TextColor3 = Color3.fromRGB(245, 245, 248)
+SaveConfigButton.TextSize = 9
+SaveConfigButton.AutoButtonColor = false
+SaveConfigButton.ZIndex = 4
+SaveConfigButton.Parent = Menu
+
+local SaveConfigCorner = Instance.new("UICorner")
+SaveConfigCorner.CornerRadius = UDim.new(0, 6)
+SaveConfigCorner.Parent = SaveConfigButton
+
+local SaveConfigStroke = Instance.new("UIStroke")
+SaveConfigStroke.Color = Color3.fromRGB(155, 155, 160)
+SaveConfigStroke.Thickness = 1
+SaveConfigStroke.Transparency = 0.45
+SaveConfigStroke.Parent = SaveConfigButton
+
+SaveConfigButton.Activated:Connect(function()
+    local Config = {
+        FOV = FOV,
+        TrackingStrength = TrackingStrength,
+        TeamCheck = TeamCheck,
+        AimEnabled = AimEnabled,
+        ESPEnabled = ESPEnabled,
+        FOVCircleEnabled = FOVCircleEnabled,
+    }
+    if type(writefile) == "function" then
+        local ok = pcall(function()
+            writefile(ConfigFileName, HttpService:JSONEncode(Config))
+        end)
+        SaveConfigButton.Text = ok and "Saved!" or "Save Failed"
+    else
+        SaveConfigButton.Text = "No File API"
+    end
+    task.delay(1.5, function()
+        if SaveConfigButton and SaveConfigButton.Parent then
+            SaveConfigButton.Text = "Save Config"
+        end
+    end)
+end)
+
+local Subtitle = Instance.new("TextLabel")
+Subtitle.Name = "Subtitle"
+Subtitle.BackgroundTransparency = 1
+Subtitle.Position = UDim2.fromOffset(10, 24)
+Subtitle.Size = UDim2.new(1, -20, 0, 14)
+Subtitle.Font = Enum.Font.Gotham
+Subtitle.Text = "Lucky Edition"
+Subtitle.TextColor3 = Color3.fromRGB(170, 170, 175)
+Subtitle.TextSize = 9
+Subtitle.TextXAlignment = Enum.TextXAlignment.Left
+Subtitle.ZIndex = 3
+Subtitle.Parent = Menu
+
+local AimButton = Instance.new("TextButton")
+AimButton.Name = "AimAssistButton"
+AimButton.Position = UDim2.fromOffset(10, 42)
+AimButton.Size = UDim2.new(1, -20, 0, 30)
+AimButton.BackgroundTransparency = 0
+AimButton.BackgroundColor3 = AimEnabled and Color3.fromRGB(82, 82, 88) or Color3.fromRGB(48, 48, 52)
+AimButton.BorderSizePixel = 0
+AimButton.Font = Enum.Font.GothamBold
+AimButton.Text = AimEnabled and "Aim Assist: ON" or "Aim Assist: OFF"
+AimButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+AimButton.TextSize = 12
+AimButton.AutoButtonColor = false
+AimButton.ZIndex = 3
+AimButton.Parent = Menu
+
+local AimButtonStroke = Instance.new("UIStroke")
+AimButtonStroke.Color = Color3.fromRGB(150, 150, 155)
+AimButtonStroke.Thickness = 1
+AimButtonStroke.Transparency = 0.55
+AimButtonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+AimButtonStroke.Parent = AimButton
+
+local ButtonCorner = Instance.new("UICorner")
+ButtonCorner.CornerRadius = UDim.new(0, 8)
+ButtonCorner.Parent = AimButton
+
+local ESPButton = Instance.new("TextButton")
+ESPButton.Name = "ESPButton"
+ESPButton.Position = UDim2.fromOffset(10, 78)
+ESPButton.Size = UDim2.new(1, -20, 0, 30)
+ESPButton.BackgroundTransparency = 0
+ESPButton.BackgroundColor3 = ESPEnabled and Color3.fromRGB(82, 82, 88) or Color3.fromRGB(48, 48, 52)
+ESPButton.BorderSizePixel = 0
+ESPButton.Font = Enum.Font.GothamBold
+ESPButton.Text = ESPEnabled and "ESP: ON" or "ESP: OFF"
+ESPButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ESPButton.TextSize = 12
+ESPButton.AutoButtonColor = false
+ESPButton.ZIndex = 3
+ESPButton.Parent = Menu
+
+local ESPButtonStroke = Instance.new("UIStroke")
+ESPButtonStroke.Color = Color3.fromRGB(150, 150, 155)
+ESPButtonStroke.Thickness = 1
+ESPButtonStroke.Transparency = 0.55
+ESPButtonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+ESPButtonStroke.Parent = ESPButton
+
+local ESPButtonCorner = Instance.new("UICorner")
+ESPButtonCorner.CornerRadius = UDim.new(0, 8)
+ESPButtonCorner.Parent = ESPButton
+
+local TeamButton = Instance.new("TextButton")
+TeamButton.Name = "TeamCheckButton"
+TeamButton.Position = UDim2.fromOffset(10, 114)
+TeamButton.Size = UDim2.new(1, -20, 0, 28)
+TeamButton.BackgroundTransparency = 0
+TeamButton.BackgroundColor3 = TeamCheck and Color3.fromRGB(82, 82, 88) or Color3.fromRGB(48, 48, 52)
+TeamButton.BorderSizePixel = 0
+TeamButton.Font = Enum.Font.GothamBold
+TeamButton.Text = TeamCheck and "Team Check: ON" or "Team Check: OFF"
+TeamButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+TeamButton.TextSize = 11
+TeamButton.AutoButtonColor = false
+TeamButton.ZIndex = 3
+TeamButton.Parent = Menu
+
+local TeamButtonStroke = Instance.new("UIStroke")
+TeamButtonStroke.Color = Color3.fromRGB(150, 150, 155)
+TeamButtonStroke.Thickness = 1
+TeamButtonStroke.Transparency = 0.55
+TeamButtonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+TeamButtonStroke.Parent = TeamButton
+
+local TeamButtonCorner = Instance.new("UICorner")
+TeamButtonCorner.CornerRadius = UDim.new(0, 8)
+TeamButtonCorner.Parent = TeamButton
+
+local function MakeSlider(Name, LabelText, Y, Minimum, Maximum, InitialValue, FormatValue, OnChanged)
+    local Label = Instance.new("TextLabel")
+    Label.Name = Name .. "Label"
+    Label.BackgroundTransparency = 1
+    Label.Position = UDim2.fromOffset(10, Y)
+    Label.Size = UDim2.new(1, -20, 0, 18)
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = ""
+    Label.TextColor3 = Color3.fromRGB(245, 245, 250)
+    Label.TextSize = 11
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.ZIndex = 3
+    Label.Parent = Menu
+
+    local Track = Instance.new("TextButton")
+    Track.Name = Name .. "Slider"
+    Track.Position = UDim2.fromOffset(10, Y + 19)
+    Track.Size = UDim2.new(1, -20, 0, 12)
+    Track.BackgroundColor3 = Color3.fromRGB(48, 48, 52)
+    Track.BorderSizePixel = 0
+    Track.Text = ""
+    Track.AutoButtonColor = false
+    Track.ZIndex = 3
+    Track.Parent = Menu
+
+    local TrackCorner = Instance.new("UICorner")
+    TrackCorner.CornerRadius = UDim.new(1, 0)
+    TrackCorner.Parent = Track
+
+    local Fill = Instance.new("Frame")
+    Fill.Name = "Fill"
+    Fill.Size = UDim2.new((InitialValue - Minimum) / (Maximum - Minimum), 0, 1, 0)
+    Fill.BackgroundColor3 = Color3.fromRGB(205, 205, 210)
+    Fill.BorderSizePixel = 0
+    Fill.ZIndex = 4
+    Fill.Parent = Track
+
+    local FillCorner = Instance.new("UICorner")
+    FillCorner.CornerRadius = UDim.new(1, 0)
+    FillCorner.Parent = Fill
+
+    local Knob = Instance.new("Frame")
+    Knob.Name = "Knob"
+    Knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    Knob.Position = UDim2.new((InitialValue - Minimum) / (Maximum - Minimum), 0, 0.5, 0)
+    Knob.Size = UDim2.fromOffset(14, 14)
+    Knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    Knob.BorderSizePixel = 0
+    Knob.ZIndex = 5
+    Knob.Parent = Track
+
+    local KnobCorner = Instance.new("UICorner")
+    KnobCorner.CornerRadius = UDim.new(1, 0)
+    KnobCorner.Parent = Knob
+
+    local Value = InitialValue
+    local Sliding = false
+
+    local function SetFromX(X)
+        local Width = math.max(1, Track.AbsoluteSize.X)
+        local Alpha = math.clamp((X - Track.AbsolutePosition.X) / Width, 0, 1)
+        Value = Minimum + (Maximum - Minimum) * Alpha
+        if Maximum > 10 then
+            Value = math.floor(Value + 0.5)
+        else
+            Value = math.floor(Value * 100 + 0.5) / 100
+        end
+        local Percent = (Value - Minimum) / (Maximum - Minimum)
+        Fill.Size = UDim2.new(Percent, 0, 1, 0)
+        Knob.Position = UDim2.new(Percent, 0, 0.5, 0)
+        Label.Text = LabelText .. ": " .. FormatValue(Value)
+        OnChanged(Value)
+    end
+
+    Label.Text = LabelText .. ": " .. FormatValue(InitialValue)
+
+    Track.InputBegan:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.MouseButton1
+            or Input.UserInputType == Enum.UserInputType.Touch then
+            Sliding = true
+            SetFromX(Input.Position.X)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(Input)
+        if Sliding and (Input.UserInputType == Enum.UserInputType.MouseMovement
+            or Input.UserInputType == Enum.UserInputType.Touch) then
+            SetFromX(Input.Position.X)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.MouseButton1
+            or Input.UserInputType == Enum.UserInputType.Touch then
+            Sliding = false
+        end
+    end)
+
+    return Label
+end
+
+TeamButton.Activated:Connect(function()
+    TeamCheck = not TeamCheck
+    TeamButton.Text = TeamCheck and "Team Check: ON" or "Team Check: OFF"
+    TeamButton.BackgroundColor3 = TeamCheck
+        and Color3.fromRGB(82, 82, 88)
+        or Color3.fromRGB(48, 48, 52)
+end)
+
+MakeSlider("FOV", "FOV", 148, 20, 300, FOV, function(Value)
+    return tostring(Value) .. " px"
+end, function(Value)
+    FOV = Value
+    FOVCircle.Size = UDim2.fromOffset(FOV * 2, FOV * 2)
+end)
+
+MakeSlider("Smoothness", "Smoothness", 190, 0.01, 0.50, TrackingStrength, function(Value)
+    return string.format("%.2f", Value)
+end, function(Value)
+    TrackingStrength = Value
+end)
+
+local FOVCircleButton = Instance.new("TextButton")
+FOVCircleButton.Name = "FOVCircleButton"
+FOVCircleButton.Position = UDim2.fromOffset(10, 232)
+FOVCircleButton.Size = UDim2.new(1, -20, 0, 28)
+FOVCircleButton.BackgroundColor3 = FOVCircleEnabled and Color3.fromRGB(82, 82, 88) or Color3.fromRGB(48, 48, 52)
+FOVCircleButton.BackgroundTransparency = 0
+FOVCircleButton.BorderSizePixel = 0
+FOVCircleButton.Font = Enum.Font.GothamBold
+FOVCircleButton.Text = FOVCircleEnabled and "FOV Circle: ON" or "FOV Circle: OFF"
+FOVCircleButton.TextColor3 = Color3.fromRGB(245, 248, 255)
+FOVCircleButton.TextSize = 11
+FOVCircleButton.AutoButtonColor = false
+FOVCircleButton.ZIndex = 3
+FOVCircleButton.Parent = Menu
+
+local FOVCircleButtonCorner = Instance.new("UICorner")
+FOVCircleButtonCorner.CornerRadius = UDim.new(0, 8)
+FOVCircleButtonCorner.Parent = FOVCircleButton
+
+local FOVCircleButtonStroke = Instance.new("UIStroke")
+FOVCircleButtonStroke.Color = Color3.fromRGB(150, 150, 155)
+FOVCircleButtonStroke.Transparency = 0.55
+FOVCircleButtonStroke.Thickness = 1
+FOVCircleButtonStroke.Parent = FOVCircleButton
+
+FOVCircleButton.Activated:Connect(function()
+    FOVCircleEnabled = not FOVCircleEnabled
+    FOVCircle.Visible = FOVCircleEnabled
+    FOVCircleButton.Text = FOVCircleEnabled and "FOV Circle: ON" or "FOV Circle: OFF"
+    FOVCircleButton.BackgroundColor3 = FOVCircleEnabled
+        and Color3.fromRGB(82, 82, 88)
+        or Color3.fromRGB(48, 48, 52)
+end)
+
+local function RemoveESP(Player)
+    local Highlight = ESPHighlights[Player]
+    if Highlight then
+        Highlight:Destroy()
+        ESPHighlights[Player] = nil
+    end
+end
+
+local function CreateESP(Player)
+    if Player == LocalPlayer then
+        return
+    end
+    local Character = Player.Character
+    if not Character then
+        RemoveESP(Player)
+        return
+    end
+    local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+    if not Humanoid or Humanoid.Health <= 0 then
+        RemoveESP(Player)
+        return
+    end
+    local Highlight = ESPHighlights[Player]
+    if not Highlight or Highlight.Parent ~= Character then
+        RemoveESP(Player)
+        Highlight = Instance.new("Highlight")
+        Highlight.Name = "LuckyTeamESP"
+        Highlight.Adornee = Character
+        H
